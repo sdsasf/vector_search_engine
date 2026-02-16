@@ -1,0 +1,22 @@
+# build artifacts
+build/
+cmake-build-*/
+out/
+bin/
+obj/
+
+# CMake
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+
+data/
