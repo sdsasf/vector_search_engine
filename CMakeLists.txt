@@ -1,18 +1,34 @@
 cmake_minimum_required(VERSION 3.14)
 project(VectorSearchEngine CXX)
 
-# 设置 C++ 标准
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
-
-# 开启 O3 优化，并显式启用 AVX2 和 FMA 指令集支持
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -O3 -mavx2 -mfma")
 
-# 添加头文件搜索路径
 include_directories(include)
 
-# 编译核心库
+# 寻找 Protobuf 和 bRPC
+find_package(Protobuf REQUIRED)
+find_path(BRPC_INCLUDE_PATH NAMES brpc/server.h)
+find_library(BRPC_LIB NAMES brpc)
+include_directories(${BRPC_INCLUDE_PATH})
+
+# 编译 Protobuf 文件
+file(MAKE_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR}/proto)
+execute_process(
+    COMMAND ${PROTOBUF_PROTOC_EXECUTABLE} --cpp_out=${CMAKE_CURRENT_BINARY_DIR}/proto --proto_path=${CMAKE_CURRENT_SOURCE_DIR}/proto ${CMAKE_CURRENT_SOURCE_DIR}/proto/vector_search.proto
+)
+include_directories(${CMAKE_CURRENT_BINARY_DIR}/proto)
+
+# 编译底层核心库
 add_library(core_distance src/distance.cpp)
 
-# 添加 benchmark 目录
+# 编译 bRPC 服务端
+add_executable(vector_server src/server.cpp ${CMAKE_CURRENT_BINARY_DIR}/proto/vector_search.pb.cc)
+target_link_libraries(vector_server core_distance ${BRPC_LIB} protobuf gflags leveldb ssl crypto pthread)
+
 add_subdirectory(benchmark)
+
+# 编译 bRPC 压测客户端
+add_executable(client_bench benchmark/client_bench.cpp ${CMAKE_CURRENT_BINARY_DIR}/proto/vector_search.pb.cc)
+target_link_libraries(client_bench ${BRPC_LIB} protobuf gflags leveldb ssl crypto pthread)
