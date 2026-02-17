@@ -4,21 +4,34 @@ package vector_search.pb;
 
 option cc_generic_services = true;
 
-// 搜索请求
+// search request
 message SearchRequest {
     repeated float query_vector = 1; // 查询向量
     int32 k = 2;                     // Top K
     int32 ef_search = 3;             // 搜索深度
 }
 
-// 搜索响应
+// search response
 message SearchResponse {
     repeated uint32 ids = 1;         // 召回的节点 ID 列表
     int32 code = 2;                  // 状态码 (0 表示成功)
     string message = 3;              // 错误信息
 }
 
+// insert request
+message InsertRequest {
+    repeated float vector = 1;
+    uint32 id = 2;
+}
+
+// insert response
+message InsertResponse {
+    int32 code = 1;
+    string message = 2;
+}
+
 // 定义 RPC 服务
 service VectorSearchService {
     rpc Search(SearchRequest) returns (SearchResponse);
+    rpc Insert(InsertRequest) returns (InsertResponse);
 }

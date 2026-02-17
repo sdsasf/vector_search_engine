@@ -17,6 +17,23 @@ struct NeighborList {
     uint32_t neighbors[]; // 柔性数组
 };
 
+// 高效自旋锁，适用于短时间的锁持有，专用于原地高频更新
+struct SpinLock {
+    std::atomic_flag locked = ATOMIC_FLAG_INIT;
+
+    inline void lock() {
+        // test_and_set() 映射到底层的 XCHG 指令
+        while (locked.test_and_set(std::memory_order_acquire)) {
+            // _mm_pause() 告诉 CPU 这是一个自旋循环，防止流水线乱序执行引发的惩罚
+            _mm_pause(); 
+        }
+    }
+
+    inline void unlock() {
+        locked.clear(std::memory_order_release);
+    }
+};
+
 struct alignas(CACHE_LINE_SIZE) HnswNode {
     const float* vector_data; 
     
@@ -24,6 +41,7 @@ struct alignas(CACHE_LINE_SIZE) HnswNode {
     std::atomic<NeighborList*> neighbor_lists[MAX_HNSW_LEVELS];
 
     int level; // 该节点所在的最高层数
+    SpinLock node_lock; // 保护节点状态的自旋锁
 
     // 初始化节点
     void init(const float* data, int max_level) {
@@ -33,6 +51,7 @@ struct alignas(CACHE_LINE_SIZE) HnswNode {
             neighbor_lists[i].store(nullptr, std::memory_order_relaxed);
         }
     }
+
 
     // 【修复】接收 layer 参数，获取指定层的邻居表
     NeighborList* get_neighbors_rcu(int layer) const {
