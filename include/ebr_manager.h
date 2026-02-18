@@ -1,108 +1,264 @@
 #pragma once
+
+#include <array>
 #include <atomic>
-#include <vector>
-#include <thread>
+#include <cstddef>
+#include <cstdlib>
+#include <cstdint>
 #include <mutex>
+#include <type_traits>
+#include <vector>
 
 namespace vector_search {
 
+// é«˜æ€§èƒ½ EBRï¼ˆEpoch-Based Reclamationï¼‰ç®¡ç†å™¨ã€‚
+// è®¾è®¡ç›®æ ‡ï¼š
+// 1) è¯»ä¾§å¼€é”€æä½ï¼ˆpin/unpin ä»… thread-local + åŸå­è¯»å†™ï¼‰ï¼›
+// 2) å†™ä¾§å»¶è¿Ÿå›æ”¶ï¼ˆæœ¬åœ°æ‰¹é‡é€€ä¼‘ + å…¨å±€åˆ†æ¡¶å›æ”¶ï¼‰ï¼›
+// 3) æ”¯æŒçº¿ç¨‹åŠ¨æ€æ³¨å†Œ/æ³¨é”€ï¼›
+// 4) C++17 å¯ç¼–è¯‘ï¼Œæ”¯æŒè‡ªå®šä¹‰ deleterã€‚
 class EBRManager {
 public:
-    // »ñÈ¡µ¥Àı
     static EBRManager& get_instance() {
         static EBRManager instance;
         return instance;
     }
 
-    // ¡¾¶ÁÏß³Ì×¨ÓÃ¡¿½øÈë RCU ÁÙ½çÇø£¨¿ªÊ¼ËÑË÷£©
+    // è¿›å…¥è¯»ä¾§ä¸´ç•ŒåŒºï¼ˆæ”¯æŒåµŒå¥—ï¼‰
     void enter_rcu_read() {
-        // ¶ÁÈ¡µ±Ç°µÄÈ«¾Ö¼ÍÔª£¬²¢¼ÇÂ¼µ½µ±Ç°Ïß³ÌµÄ¾Ö²¿±äÁ¿ÖĞ
-        uint64_t current_epoch = global_epoch_.load(std::memory_order_acquire);
-        local_epochs_[get_thread_id()].val.store(current_epoch, std::memory_order_release);
-        active_threads_[get_thread_id()].val.store(true, std::memory_order_release);
+        Participant& p = local_participant();
+        const uint32_t prev = p.pin_count.load(std::memory_order_relaxed);
+        if (prev == 0U) {
+            const uint64_t epoch = global_epoch_.load(std::memory_order_acquire);
+            p.local_epoch.store(epoch, std::memory_order_release);
+            p.active.store(true, std::memory_order_release);
+        }
+        p.pin_count.store(prev + 1U, std::memory_order_relaxed);
     }
 
-    // ¡¾¶ÁÏß³Ì×¨ÓÃ¡¿Àë¿ª RCU ÁÙ½çÇø£¨ËÑË÷½áÊø£©
+    // ç¦»å¼€è¯»ä¾§ä¸´ç•ŒåŒº
     void exit_rcu_read() {
-        active_threads_[get_thread_id()].val.store(false, std::memory_order_release);
+        Participant& p = local_participant();
+        const uint32_t prev = p.pin_count.load(std::memory_order_relaxed);
+        if (prev <= 1U) {
+            p.pin_count.store(0U, std::memory_order_relaxed);
+            p.active.store(false, std::memory_order_release);
+            maybe_flush_local_retired(p);
+            return;
+        }
+        p.pin_count.store(prev - 1U, std::memory_order_relaxed);
     }
 
-    // ¡¾Ğ´Ïß³Ì×¨ÓÃ¡¿°Ñ·ÏÆúµÄÄÚ´æÈÓ½øÑÓ³Ù»ØÊÕ¶ÓÁĞ
+    // å»¶è¿Ÿé‡Šæ”¾ malloc/new[] ç­‰å…¼å®¹ free çš„å†…å­˜ã€‚
     void defer_free(void* ptr) {
-        uint64_t current_epoch = global_epoch_.load(std::memory_order_acquire);
-        
-        std::lock_guard<std::mutex> lock(retire_mutex_);
-        retire_list_.push_back({ptr, current_epoch});
-        
-        // Ã¿»ıÔÜÒ»¶¨ÊıÁ¿µÄ·ÏÆúÄÚ´æ£¬³¢ÊÔÍÆ½øÒ»´Î¼ÍÔª²¢ÇåÀí
-        if (retire_list_.size() >= 1024) {
-            try_reclaim();
+        defer_delete(ptr, &EBRManager::free_deleter);
+    }
+
+    // æ³›å‹å»¶è¿Ÿåˆ é™¤ï¼Œé»˜è®¤ä½¿ç”¨ deleteã€‚
+    template <typename T>
+    void defer_delete(T* ptr) {
+        static_assert(!std::is_void<T>::value, "void* please use defer_free or custom deleter");
+        defer_delete(static_cast<void*>(ptr), &EBRManager::typed_delete<T>);
+    }
+
+    // å»¶è¿Ÿåˆ é™¤ï¼ˆè‡ªå®šä¹‰ deleterï¼‰ã€‚
+    void defer_delete(void* ptr, void (*deleter)(void*)) {
+        if (ptr == nullptr || deleter == nullptr) {
+            return;
+        }
+
+        Participant& p = local_participant();
+        const uint64_t epoch = global_epoch_.load(std::memory_order_acquire);
+        p.local_retired.emplace_back(RetiredNode{ptr, deleter, epoch});
+
+        if (p.local_retired.size() >= kLocalBatchThreshold) {
+            flush_local_retired(p);
+            try_advance_epoch_and_reclaim();
         }
     }
 
-private:
-    EBRManager() {}
+    // ä¸»åŠ¨è§¦å‘ä¸€æ¬¡å›æ”¶å°è¯•ï¼ˆå¯åœ¨åå°çº¿ç¨‹å‘¨æœŸè°ƒç”¨ï¼‰
+    void collect() {
+        Participant& p = local_participant();
+        flush_local_retired(p);
+        try_advance_epoch_and_reclaim();
+    }
 
-    // ÍÆ½ø¼ÍÔª²¢»ØÊÕ°²È«ÄÚ´æ
-    void try_reclaim() {
-        uint64_t current_epoch = global_epoch_.load(std::memory_order_acquire);
-        
-        // ¼ì²éËùÓĞ»îÔ¾Ïß³Ì£¬ÕÒ³öËüÃÇÖĞ×îÀÏµÄÄÇ¸ö¼ÍÔª
-        uint64_t min_active_epoch = current_epoch;
-        for (size_t i = 0; i < MAX_THREADS; ++i) {
-            if (active_threads_[i].val.load(std::memory_order_acquire)) {
-                uint64_t thread_epoch = local_epochs_[i].val.load(std::memory_order_acquire);
-                if (thread_epoch < min_active_epoch) {
-                    min_active_epoch = thread_epoch;
+    uint64_t current_epoch() const {
+        return global_epoch_.load(std::memory_order_acquire);
+    }
+
+private:
+    struct RetiredNode {
+        void* ptr;
+        void (*deleter)(void*);
+        uint64_t retire_epoch;
+    };
+
+    struct alignas(64) Participant {
+        std::atomic<uint64_t> local_epoch{0};
+        std::atomic<uint32_t> pin_count{0};
+        std::atomic<bool> active{false};
+        std::vector<RetiredNode> local_retired;
+    };
+
+    class ThreadSlot {
+    public:
+        ThreadSlot() {
+            EBRManager::get_instance().register_thread(&participant_);
+        }
+
+        ~ThreadSlot() {
+            EBRManager::get_instance().unregister_thread(&participant_);
+        }
+
+        Participant& participant() { return participant_; }
+
+    private:
+        Participant participant_;
+    };
+
+    EBRManager() = default;
+    ~EBRManager() {
+        // è¿›ç¨‹é€€å‡ºæ—¶å°½åŠ›æ¸…ç†ã€‚
+        reclaim_all();
+    }
+
+    EBRManager(const EBRManager&) = delete;
+    EBRManager& operator=(const EBRManager&) = delete;
+
+    static Participant& local_participant() {
+        static thread_local ThreadSlot slot;
+        return slot.participant();
+    }
+
+    void register_thread(Participant* participant) {
+        std::lock_guard<std::mutex> lock(participants_mutex_);
+        participants_.push_back(participant);
+        participant->local_retired.reserve(kLocalBatchThreshold);
+    }
+
+    void unregister_thread(Participant* participant) {
+        // å…ˆå°†æœ¬åœ°é€€ä¼‘å¯¹è±¡åˆ·å…¥å…¨å±€é˜Ÿåˆ—ï¼Œå†ä»å‚ä¸è€…åˆ—è¡¨ç§»é™¤ã€‚
+        flush_local_retired(*participant);
+
+        {
+            std::lock_guard<std::mutex> lock(participants_mutex_);
+            for (auto it = participants_.begin(); it != participants_.end(); ++it) {
+                if (*it == participant) {
+                    participants_.erase(it);
+                    break;
                 }
             }
         }
 
-        // Èç¹ûËùÓĞ»îÔ¾Ïß³Ì¶¼¸úÉÏÁËµ±Ç°¼ÍÔª£¬ÎÒÃÇ¾Í¿ÉÒÔ½«È«¾Ö¼ÍÔª +1
-        if (min_active_epoch == current_epoch) {
-            global_epoch_.fetch_add(1, std::memory_order_release);
+        try_advance_epoch_and_reclaim();
+    }
+
+    void maybe_flush_local_retired(Participant& participant) {
+        if (participant.local_retired.size() >= (kLocalBatchThreshold / 2U)) {
+            flush_local_retired(participant);
+        }
+    }
+
+    void flush_local_retired(Participant& participant) {
+        if (participant.local_retired.empty()) {
+            return;
         }
 
-        // »ØÊÕÄÇĞ©ÔÚ min_active_epoch Ö®Ç°±»·ÏÆúµÄÄÚ´æ
-        // ÒòÎªÒÑ¾­Ã»ÓĞÈÎºÎ»îÔ¾Ïß³ÌÄÜ·ÃÎÊµ½ËüÃÇÁË£¡
-        auto it = retire_list_.begin();
-        while (it != retire_list_.end()) {
-            if (it->retire_epoch < min_active_epoch) {
-                free(it->ptr); // ÕæÕıÊÍ·ÅÎïÀíÄÚ´æ£¡
-                it = retire_list_.erase(it);
-            } else {
-                ++it;
+        std::lock_guard<std::mutex> lock(retire_mutex_);
+        for (const RetiredNode& node : participant.local_retired) {
+            global_retired_[bucket_index(node.retire_epoch)].push_back(node);
+        }
+        participant.local_retired.clear();
+    }
+
+    void try_advance_epoch_and_reclaim() {
+        uint64_t observed = global_epoch_.load(std::memory_order_acquire);
+        if (can_advance_epoch(observed)) {
+            (void)global_epoch_.compare_exchange_strong(
+                observed,
+                observed + 1,
+                std::memory_order_acq_rel,
+                std::memory_order_acquire);
+        }
+
+        const uint64_t current = global_epoch_.load(std::memory_order_acquire);
+        if (current < 2U) {
+            return;
+        }
+
+        const uint64_t reclaim_epoch = current - 2U;
+        reclaim_epoch_bucket(reclaim_epoch);
+    }
+
+    bool can_advance_epoch(uint64_t observed_epoch) {
+        std::lock_guard<std::mutex> lock(participants_mutex_);
+        for (Participant* participant : participants_) {
+            if (!participant->active.load(std::memory_order_acquire)) {
+                continue;
+            }
+
+            const uint64_t e = participant->local_epoch.load(std::memory_order_acquire);
+            if (e != observed_epoch) {
+                return false;
             }
         }
+        return true;
     }
 
-    // ¸¨Öúº¯Êı£º·ÖÅäÒ»¸ö¼òµ¥µÄÏß³Ì ID (0 ~ MAX_THREADS-1)
-    static size_t get_thread_id() {
-        static std::atomic<size_t> id_counter{0};
-        thread_local size_t thread_id = id_counter.fetch_add(1);
-        return thread_id;
+    void reclaim_epoch_bucket(uint64_t safe_epoch) {
+        std::lock_guard<std::mutex> lock(retire_mutex_);
+        std::vector<RetiredNode>& bucket = global_retired_[bucket_index(safe_epoch)];
+
+        std::size_t write = 0;
+        for (std::size_t read = 0; read < bucket.size(); ++read) {
+            RetiredNode& node = bucket[read];
+            if (node.retire_epoch <= safe_epoch) {
+                node.deleter(node.ptr);
+            } else {
+                if (write != read) {
+                    bucket[write] = node;
+                }
+                ++write;
+            }
+        }
+        bucket.resize(write);
     }
 
-    // ¶¨Òå³£Á¿ºÍ×´Ì¬
-    static constexpr size_t MAX_THREADS = 128;
-    
+    void reclaim_all() {
+        std::lock_guard<std::mutex> lock(retire_mutex_);
+        for (auto& bucket : global_retired_) {
+            for (RetiredNode& node : bucket) {
+                node.deleter(node.ptr);
+            }
+            bucket.clear();
+        }
+    }
+
+    static void free_deleter(void* ptr) {
+        std::free(ptr);
+    }
+
+    template <typename T>
+    static void typed_delete(void* ptr) {
+        delete static_cast<T*>(ptr);
+    }
+
+    static constexpr std::size_t kEpochBuckets = 3;
+    static constexpr std::size_t kLocalBatchThreshold = 64;
+
+    static std::size_t bucket_index(uint64_t epoch) {
+        return static_cast<std::size_t>(epoch % kEpochBuckets);
+    }
+
     std::atomic<uint64_t> global_epoch_{1};
-    
-    // ÓÃÊı×éÀ´±ÜÃâ False Sharing µÄÎÊÌâ£¨Êµ¼Ê¹¤³ÌÖĞÕâÀïĞèÒª alignas(64) ¶ÔÆë£©
-    struct alignas(64) ThreadState { std::atomic<uint64_t> val{0}; };
-    struct alignas(64) ThreadActive { std::atomic<bool> val{false}; };
-    
-    ThreadState local_epochs_[MAX_THREADS];
-    ThreadActive active_threads_[MAX_THREADS];
 
-    // ·ÏÆúÄÚ´æ¿é¼ÇÂ¼
-    struct RetiredPtr {
-        void* ptr;
-        uint64_t retire_epoch;
-    };
-    
-    std::mutex retire_mutex_; // ±£»¤À¬»øÍ°µÄËø£¨Ğ´Ïß³Ì±¾À´¾Í²»¶à£¬ÕâÀïÓÃËøÊÇ¿ÉÒÔ½ÓÊÜµÄ£©
-    std::vector<RetiredPtr> retire_list_;
+    mutable std::mutex participants_mutex_;
+    std::vector<Participant*> participants_;
+
+    std::mutex retire_mutex_;
+    std::array<std::vector<RetiredNode>, kEpochBuckets> global_retired_{};
 };
 
 } // namespace vector_search
